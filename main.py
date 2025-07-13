@@ -6,39 +6,36 @@ import time
 import asyncio
 from dotenv import load_dotenv
 from collections import defaultdict
+from http.server import SimpleHTTPRequestHandler, HTTPServer
+import threading
 
-# Load token and guild from environment (Render handles this)
+# Run dummy server so Render doesn't complain about ports
+def run_web_server():
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHTTPRequestHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_web_server, daemon=True).start()
+
+# Load token & guild from Render's env
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID"))
-MOD_ROLE_ID = 1391654796989169707  # Only users with this role can use commands
+MOD_ROLE_ID = 1391654796989169707
 
-# Enable required Discord intents
+# Intents required (make sure you enable them in the Dev Portal)
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
 
-# Default prefix and server-based prefix map
+# Prefix system
 DEFAULT_PREFIX = "!"
 prefixes = defaultdict(lambda: DEFAULT_PREFIX)
 
-# Track ping counts: guild_id → target_id → [timestamps]
+# Track pings: guild -> target_id -> list[timestamps]
 mention_tracker = defaultdict(lambda: defaultdict(list))
 
-# Mute logic: apply "Muted" role and remove after timeout
-async def get_or_create_mute_role(guild):
-    role = discord.utils.get(guild.roles, name="Muted")
-    if not role:
-        role = await guild.create_role(name="Muted", reason="For ping punishments")
-        for channel in guild.channels:
-            try:
-                await channel.set_permissions(role, send_messages=False, add_reactions=False)
-            except Exception:
-                continue
-    return role
-
-# Bot class with prefix getter and slash command sync
+# Create bot
 class PingBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=self.get_prefix, intents=intents)
@@ -57,57 +54,55 @@ bot = PingBot()
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
-# ✅ SLASH COMMAND: Set custom prefix
-@bot.tree.command(name="setprefix", description="Set the prefix for this server (admins only)")
-@app_commands.describe(new_prefix="The new prefix to use")
+# Slash command: Set prefix
+@bot.tree.command(name="setprefix", description="Set a custom prefix for this server")
+@app_commands.describe(new_prefix="New command prefix")
 async def setprefix(interaction: discord.Interaction, new_prefix: str):
     if MOD_ROLE_ID not in [r.id for r in interaction.user.roles]:
-        await interaction.response.send_message("❌ You don't have permission to set the prefix.", ephemeral=True)
+        await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
         return
     prefixes[interaction.guild.id] = new_prefix
     await interaction.response.send_message(f"✅ Prefix set to `{new_prefix}`", ephemeral=True)
 
-# ✅ SLASH COMMAND: Protect a member or role
-@bot.tree.command(name="pingpunish", description="Protect a user or role from being pinged twice")
-@app_commands.describe(target="The member or role to protect")
+# Slash command: Protect someone from pings
+@bot.tree.command(name="pingpunish", description="Protect a user or role from double-pings")
+@app_commands.describe(target="The user or role to protect")
 async def slash_pingpunish(interaction: discord.Interaction, target: discord.Member | discord.Role):
     if MOD_ROLE_ID not in [r.id for r in interaction.user.roles]:
-        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
         return
     mention_tracker[interaction.guild.id][target.id] = []
-    await interaction.response.send_message(f"🔒 {target.mention} is now protected from double pings.", ephemeral=True)
+    await interaction.response.send_message(f"🔒 {target.mention} is now protected from double-pings.", ephemeral=True)
 
-# ✅ PREFIX COMMAND: Same as above but with text command
+# Prefix version of pingpunish
 @bot.command(name="pingpunish")
 async def prefix_pingpunish(ctx, target: discord.Member | discord.Role):
     if MOD_ROLE_ID not in [r.id for r in ctx.author.roles]:
-        await ctx.send("❌ You don't have permission to use this command.")
+        await ctx.send("❌ You don't have permission.")
         return
     mention_tracker[ctx.guild.id][target.id] = []
-    await ctx.send(f"🔒 {target.mention} is now protected from double pings.")
+    await ctx.send(f"🔒 {target.mention} is now protected from double-pings.")
 
-# ✅ EVENT: Detect double pings and apply mute
+# Event: Check pings and mute
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
-    now = time.time()
     guild_id = message.guild.id
+    now = time.time()
     mentioned_ids = [m.id for m in message.mentions] + [r.id for r in message.role_mentions]
 
     for target_id, timestamps in mention_tracker[guild_id].items():
         if target_id in mentioned_ids:
-            timestamps = [t for t in timestamps if now - t < 60]  # Keep only recent
+            timestamps = [t for t in timestamps if now - t < 60]
             timestamps.append(now)
             mention_tracker[guild_id][target_id] = timestamps
 
             if len(timestamps) >= 2:
                 mute_role = await get_or_create_mute_role(message.guild)
-                await message.author.add_roles(mute_role, reason="Double pinged protected user/role")
-                await message.channel.send(
-                    f"🔇 {message.author.mention} was muted for pinging <@{target_id}> twice within 60 seconds."
-                )
+                await message.author.add_roles(mute_role, reason="Double pinged protected member")
+                await message.channel.send(f"🔇 {message.author.mention} muted for pinging <@{target_id}> twice.")
                 await asyncio.sleep(60)
                 await message.author.remove_roles(mute_role)
                 mention_tracker[guild_id][target_id] = []
@@ -115,5 +110,17 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# ✅ Start the bot
+# Create or get Muted role
+async def get_or_create_mute_role(guild):
+    role = discord.utils.get(guild.roles, name="Muted")
+    if not role:
+        role = await guild.create_role(name="Muted", reason="Ping protection mute")
+        for channel in guild.channels:
+            try:
+                await channel.set_permissions(role, send_messages=False, add_reactions=False)
+            except Exception:
+                continue
+    return role
+
+# Run bot
 bot.run(TOKEN)
