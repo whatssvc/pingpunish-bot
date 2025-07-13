@@ -9,7 +9,6 @@ from dotenv import load_dotenv
 from collections import defaultdict
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import threading
-import json
 
 # Dummy web server for Render
 def run_web_server():
@@ -23,60 +22,31 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID"))
 
+# Role IDs (defaults)
+PINGPROTECT_ROLE_ID = 1391654796989169707
+CONTROL_ROLE_ID = 1392243928673161296  # for /setprefix and /setcountchannel
+
 # Intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
 
-# Prefix management
+# Prefix and settings
 DEFAULT_PREFIX = "!"
 prefixes = defaultdict(lambda: DEFAULT_PREFIX)
-
-# Ping protection tracking
 mention_tracker = defaultdict(lambda: defaultdict(list))  # guild_id -> {target_id: timestamps}
-
-# Counting game tracking
 count_channels = {}        # guild_id -> channel_id
 current_count = {}         # guild_id -> number
 cooldowns = defaultdict(lambda: defaultdict(float))  # guild_id -> {user_id: cooldown_end_time}
+role_permissions = defaultdict(lambda: {
+    "pingpunish": PINGPROTECT_ROLE_ID,
+    "unpingpunish": PINGPROTECT_ROLE_ID,
+    "setprefix": CONTROL_ROLE_ID,
+    "setcountchannel": CONTROL_ROLE_ID,
+    "role": None
+})
 
-# -------------------
-# Permissions system
-# -------------------
-
-perm_file_path = "permissions.json"
-
-# Default fallback role IDs
-DEFAULT_COMMAND_ROLES = {
-    "pingpunish": 1391654796989169707,
-    "setprefix": 1392243928673161296,
-    "setcountchannel": 1392243928673161296,
-}
-
-# Load permissions
-if os.path.exists(perm_file_path):
-    with open(perm_file_path, "r") as f:
-        command_permissions = json.load(f)
-    command_permissions = {int(g): {k: int(v) for k, v in perms.items()} for g, perms in command_permissions.items()}
-else:
-    command_permissions = {}
-
-def save_permissions():
-    with open(perm_file_path, "w") as f:
-        json.dump(command_permissions, f, indent=2)
-
-def get_allowed_role(guild_id, command_name):
-    guild_perms = command_permissions.get(guild_id, {})
-    return guild_perms.get(command_name, DEFAULT_COMMAND_ROLES.get(command_name))
-
-def set_command_role(guild_id, command_name, role_id):
-    if guild_id not in command_permissions:
-        command_permissions[guild_id] = {}
-    command_permissions[guild_id][command_name] = role_id
-    save_permissions()
-
-# -------------------
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -92,54 +62,40 @@ class MyBot(commands.Bot):
 
 bot = MyBot()
 
+
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
 
-# -------------
-# Role permission set command for server owner only
-# -------------
 
-@bot.tree.command(name="role", description="Set which role can use a command (server owner only)")
-@app_commands.describe(command_name="Command to configure", role="Role to assign permission to")
-async def set_role_permission(interaction: discord.Interaction, command_name: str, role: discord.Role):
-    if interaction.user.id != interaction.guild.owner_id:
-        await interaction.response.send_message("❌ Only the server owner can change command permissions.", ephemeral=True)
-        return
+# ========================
+# Helper to check perms
+# ========================
+def has_permission(interaction: discord.Interaction, command: str):
+    allowed_role = role_permissions[interaction.guild.id].get(command)
+    return allowed_role in [role.id for role in interaction.user.roles]
 
-    command_name = command_name.lower()
-    valid_commands = DEFAULT_COMMAND_ROLES.keys()
 
-    if command_name not in valid_commands:
-        await interaction.response.send_message(f"❌ Invalid command. Valid commands: {', '.join(valid_commands)}", ephemeral=True)
-        return
-
-    set_command_role(interaction.guild.id, command_name, role.id)
-    await interaction.response.send_message(f"✅ `{command_name}` can now be used by `{role.name}`.", ephemeral=True)
-
-# -------------
-# Prefix Set Command
-# -------------
-
+# ========================
+# Set Prefix Command
+# ========================
 @bot.tree.command(name="setprefix", description="Set a custom prefix")
 @app_commands.describe(new_prefix="The new prefix to use")
 async def setprefix(interaction: discord.Interaction, new_prefix: str):
-    allowed_role = get_allowed_role(interaction.guild.id, "setprefix")
-    if allowed_role not in [role.id for role in interaction.user.roles]:
+    if not has_permission(interaction, "setprefix"):
         await interaction.response.send_message("❌ You don't have permission to set the prefix.", ephemeral=True)
         return
     prefixes[interaction.guild.id] = new_prefix
     await interaction.response.send_message(f"✅ Prefix set to `{new_prefix}`", ephemeral=True)
 
-# -------------
-# Ping Punishment
-# -------------
 
+# ========================
+# Ping Punishment
+# ========================
 @bot.tree.command(name="pingpunish", description="Protect a user or role from being pinged twice")
 @app_commands.describe(target="User or role to protect")
 async def slash_pingpunish(interaction: discord.Interaction, target: discord.Member | discord.Role):
-    allowed_role = get_allowed_role(interaction.guild.id, "pingpunish")
-    if allowed_role not in [role.id for role in interaction.user.roles]:
+    if not has_permission(interaction, "pingpunish"):
         await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
         return
     if target.id in mention_tracker[interaction.guild.id]:
@@ -148,11 +104,11 @@ async def slash_pingpunish(interaction: discord.Interaction, target: discord.Mem
     mention_tracker[interaction.guild.id][target.id] = []
     await interaction.response.send_message(f"🔒 {target.mention} is now protected.", ephemeral=True)
 
+
 @bot.tree.command(name="unpingpunish", description="Remove ping protection")
 @app_commands.describe(target="User or role to unprotect")
 async def slash_unpingpunish(interaction: discord.Interaction, target: discord.Member | discord.Role):
-    allowed_role = get_allowed_role(interaction.guild.id, "pingpunish")
-    if allowed_role not in [role.id for role in interaction.user.roles]:
+    if not has_permission(interaction, "unpingpunish"):
         await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
         return
     if target.id in mention_tracker[interaction.guild.id]:
@@ -161,10 +117,13 @@ async def slash_unpingpunish(interaction: discord.Interaction, target: discord.M
     else:
         await interaction.response.send_message(f"ℹ️ {target.mention} was not protected.", ephemeral=True)
 
+
+# ========================
+# Prefix Command Versions
+# ========================
 @bot.command(name="pingpunish")
 async def prefix_pingpunish(ctx, target: discord.Member | discord.Role):
-    allowed_role = get_allowed_role(ctx.guild.id, "pingpunish")
-    if allowed_role not in [role.id for role in ctx.author.roles]:
+    if not has_permission(await bot.get_context(ctx.message), "pingpunish"):
         await ctx.send("❌ You don't have permission.")
         return
     if target.id in mention_tracker[ctx.guild.id]:
@@ -173,10 +132,10 @@ async def prefix_pingpunish(ctx, target: discord.Member | discord.Role):
     mention_tracker[ctx.guild.id][target.id] = []
     await ctx.send(f"🔒 {target.mention} is now protected.")
 
+
 @bot.command(name="unpingpunish")
 async def prefix_unpingpunish(ctx, target: discord.Member | discord.Role):
-    allowed_role = get_allowed_role(ctx.guild.id, "pingpunish")
-    if allowed_role not in [role.id for role in ctx.author.roles]:
+    if not has_permission(await bot.get_context(ctx.message), "unpingpunish"):
         await ctx.send("❌ You don't have permission.")
         return
     if target.id in mention_tracker[ctx.guild.id]:
@@ -185,15 +144,14 @@ async def prefix_unpingpunish(ctx, target: discord.Member | discord.Role):
     else:
         await ctx.send(f"ℹ️ {target.mention} was not protected.")
 
-# -------------
-# Set Counting Channel
-# -------------
 
+# ========================
+# Set Counting Channel
+# ========================
 @bot.tree.command(name="setcountchannel", description="Set the channel for the counting game")
 @app_commands.describe(channel="The counting channel")
 async def setcountchannel(interaction: discord.Interaction, channel: discord.TextChannel):
-    allowed_role = get_allowed_role(interaction.guild.id, "setcountchannel")
-    if allowed_role not in [role.id for role in interaction.user.roles]:
+    if not has_permission(interaction, "setcountchannel"):
         await interaction.response.send_message("❌ You don't have permission to set the counting channel.", ephemeral=True)
         return
     count_channels[interaction.guild.id] = channel.id
@@ -201,21 +159,27 @@ async def setcountchannel(interaction: discord.Interaction, channel: discord.Tex
     cooldowns[interaction.guild.id] = defaultdict(float)
     await interaction.response.send_message(f"✅ Counting game set in {channel.mention}", ephemeral=True)
 
-@bot.command(name="setcountchannel")
-async def prefix_setcountchannel(ctx, channel: discord.TextChannel):
-    allowed_role = get_allowed_role(ctx.guild.id, "setcountchannel")
-    if allowed_role not in [role.id for role in ctx.author.roles]:
-        await ctx.send("❌ You don't have permission to set the counting channel.")
+
+# ========================
+# Role Permission Config
+# ========================
+@bot.tree.command(name="role", description="Set which role can use which command")
+@app_commands.describe(command="The command to assign", role="Role allowed to use it")
+async def role(interaction: discord.Interaction, command: str, role: discord.Role):
+    if interaction.user != interaction.guild.owner:
+        await interaction.response.send_message("❌ Only the **server owner** can change command permissions.", ephemeral=True)
         return
-    count_channels[ctx.guild.id] = channel.id
-    current_count[ctx.guild.id] = 0
-    cooldowns[ctx.guild.id] = defaultdict(float)
-    await ctx.send(f"✅ Counting game set in {channel.mention}")
+    valid_commands = ["pingpunish", "unpingpunish", "setprefix", "setcountchannel", "role"]
+    if command not in valid_commands:
+        await interaction.response.send_message(f"❌ Invalid command name. Choose from: {', '.join(valid_commands)}", ephemeral=True)
+        return
+    role_permissions[interaction.guild.id][command] = role.id
+    await interaction.response.send_message(f"✅ `{command}` is now restricted to {role.mention}", ephemeral=True)
 
-# -------------
+
+# ========================
 # Event Handlers
-# -------------
-
+# ========================
 @bot.event
 async def on_message(message):
     if message.author.bot or not message.guild:
@@ -237,4 +201,55 @@ async def on_message(message):
                 try:
                     await message.author.timeout(until, reason="Double pinged protected member/role")
                     await message.channel.send(f"🔇 {message.author.mention} was timed out for pinging <@{target_id}> twice.")
-                except
+                except discord.Forbidden:
+                    await message.channel.send("❌ I don't have permission to timeout this user.")
+                mention_tracker[guild_id][target_id] = []
+                return
+
+    # Counting game logic
+    if guild_id in count_channels and message.channel.id == count_channels[guild_id]:
+        expected = current_count.get(guild_id, 0) + 1
+        user_cooldowns = cooldowns[guild_id]
+        cooldown_end = user_cooldowns.get(message.author.id, 0)
+
+        if time.time() < cooldown_end:
+            return  # Still on cooldown
+
+        try:
+            number = int(message.content.strip())
+        except ValueError:
+            return
+
+        if number != expected:
+            user_cooldowns[message.author.id] = time.time() + 10
+            current_count[guild_id] = 0
+
+            embed = discord.Embed(
+                title="❌ Wrong number!",
+                description=f"{message.author.mention} messed up the count!\nRestarting...",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="⏳ Cooldown", value="10 seconds", inline=False)
+            msg = await message.channel.send(embed=embed)
+
+            for i in range(9, 0, -1):
+                await asyncio.sleep(1)
+                embed.set_field_at(0, name="⏳ Cooldown", value=f"{i} seconds", inline=False)
+                await msg.edit(embed=embed)
+
+            await asyncio.sleep(1)
+            await msg.delete()
+            return
+
+        current_count[guild_id] = number
+        bot_response = number + 1
+        current_count[guild_id] = bot_response
+        await message.channel.send(str(bot_response))
+
+    await bot.process_commands(message)
+
+
+# ========================
+# Run the Bot
+# ========================
+bot.run(TOKEN)
