@@ -235,7 +235,52 @@ async def on_message(message):
         await message.channel.send(str(bot_response))
 
     await bot.process_commands(message)
+from difflib import get_close_matches
 
+# Track banned users and their names
+banned_users_by_guild = defaultdict(dict)  # guild_id -> {name: user_id}
+
+@bot.tree.command(name="modban", description="Permanently ban a user by name or mention")
+@app_commands.describe(target="User to ban", reason="Reason for the ban")
+async def modban(interaction: discord.Interaction, target: discord.User, reason: str):
+    if target.id == interaction.user.id:
+        await interaction.response.send_message("❌ You can't ban yourself.", ephemeral=True)
+        return
+    try:
+        await interaction.guild.ban(target, reason=reason)
+        banned_users_by_guild[interaction.guild.id][target.name.lower()] = target.id
+        try:
+            await target.send(f"You have been permanently banned from **{interaction.guild.name}**.\nReason: {reason}")
+        except:
+            pass
+        await interaction.response.send_message(f"✅ Permanently banned {target.mention}")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don't have permission to ban that user.", ephemeral=True)
+
+@bot.tree.command(name="unmodban", description="Unban a previously banned user by name")
+@app_commands.describe(name="Name of the banned user")
+async def unmodban(interaction: discord.Interaction, name: str):
+    name = name.lower()
+    banned_dict = banned_users_by_guild.get(interaction.guild.id, {})
+    close_matches = get_close_matches(name, banned_dict.keys(), n=1, cutoff=0.6)
+
+    if not close_matches:
+        await interaction.response.send_message("⚠️ Couldn't find a banned user matching that name.", ephemeral=True)
+        return
+
+    matched_name = close_matches[0]
+    user_id = banned_dict[matched_name]
+    try:
+        await interaction.guild.unban(discord.Object(id=user_id), reason="Unmodban command")
+        del banned_users_by_guild[interaction.guild.id][matched_name]
+        try:
+            user = await bot.fetch_user(user_id)
+            await user.send(f"You have been unbanned from **{interaction.guild.name}**.")
+        except:
+            pass
+        await interaction.response.send_message(f"✅ Unbanned `{matched_name}`")
+    except discord.NotFound:
+        await interaction.response.send_message("⚠️ That user was not found in the ban list.", ephemeral=True)
 
 # =======================
 #  Run the Bot
